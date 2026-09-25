@@ -6,9 +6,13 @@
  * Measurement
  * -----------
  * For every assistant message, TPS = output tokens (from the message's final
- * `usage`) divided by the wall-clock time the stream was open (`message_start`
- * -> `message_end`). Output tokens include reasoning/thinking tokens, which
- * matches how providers report generation speed.
+ * `usage`) divided by the wall-clock time from the *first streamed token* to
+ * `message_end`. The clock starts on the first delta of any kind (text,
+ * thinking, or toolcall) — not on message_start — so prefill/queue time (which
+ * grows with context length) is excluded; measuring from message_start would
+ * drag long-context turns far below the model's actual generation speed.
+ * Output tokens include reasoning/thinking tokens, which matches how
+ * providers report generation speed.
  *
  * While a message is streaming, a live estimate is published using accumulated
  * text/thinking delta characters at ~4 chars/token, prefixed with `~` to mark
@@ -65,6 +69,10 @@ let samples: Sample[] = [];
 let lastExactText: string | undefined;
 
 // In-flight streaming state (one assistant message at a time).
+// `streamStart` is set on the FIRST streamed delta (text/thinking/toolcall),
+// not on message_start — prefill/TTFT would otherwise under-report TPS on
+// long-context turns.
+let tracking = false;
 let streamStart: number | undefined;
 let streamChars = 0;
 let streamModel: string | undefined;
@@ -90,13 +98,15 @@ function fmtTps(tps: number): string {
 // ---------------------------------------------------------------------------
 
 function beginStream(message: AssistantMessage): void {
-  streamStart = Date.now();
+  tracking = true;
+  streamStart = undefined; // set when the first delta arrives
   streamChars = 0;
   streamModel = (message as { model?: string }).model;
   lastLiveEmit = 0;
 }
 
 function endStream(): void {
+  tracking = false;
   streamStart = undefined;
   streamChars = 0;
   streamModel = undefined;
@@ -123,8 +133,13 @@ function recordFinal(message: AssistantMessage): void {
   const tokens = usage?.output ?? 0;
   const elapsed = streamStart !== undefined ? Date.now() - streamStart : 0;
 
-  if (!isUsableStopReason(message) || tokens < 1 || elapsed < MIN_STREAM_MS) {
-    // Not a measurable generation — restore the last exact reading.
+  if (
+    !isUsableStopReason(message) ||
+    tokens < 1 ||
+    elapsed < MIN_STREAM_MS
+  ) {
+    // Not a measurable generation (aborted/errored, no tokens, or ended
+    // before the first streamed delta) — restore the last exact reading.
     endStream();
     publish(lastExactText);
     return;
@@ -171,14 +186,23 @@ export default function piTps(pi: ExtensionAPI): void {
   });
 
   pi.on("message_update", (event) => {
-    if (streamStart === undefined) {
+    if (!tracking) {
       // Missed message_start (e.g. extension loaded mid-stream) — recover.
       const message = event.message as { role?: string };
       if (message.role !== "assistant") return;
       beginStream(event.message as AssistantMessage);
     }
     const ev = event.assistantMessageEvent as { type?: string; delta?: string };
-    if (ev.type === "text_delta" || ev.type === "thinking_delta") {
+    if (
+      ev.type === "text_delta" ||
+      ev.type === "thinking_delta" ||
+      ev.type === "toolcall_delta"
+    ) {
+      // First delta of any kind = first generated token; start the clock here.
+      if (streamStart === undefined) {
+        streamStart = Date.now();
+        lastLiveEmit = 0;
+      }
       streamChars += ev.delta?.length ?? 0;
       publishLiveEstimate();
     }
@@ -187,7 +211,7 @@ export default function piTps(pi: ExtensionAPI): void {
   pi.on("message_end", (event) => {
     const message = event.message as { role?: string };
     if (message.role !== "assistant") return;
-    if (streamStart === undefined) return;
+    if (!tracking) return;
     recordFinal(event.message as AssistantMessage);
   });
 
